@@ -1,0 +1,10 @@
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.claude/
+.agent/
