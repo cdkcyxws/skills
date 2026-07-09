@@ -248,7 +248,9 @@ logger.error("数据库连接失败", exc_info=True)
 
 ```python
 class AppError(Exception):
-    """项目业务异常。"""
+    """
+    项目业务异常。
+    """
 
     def __init__(self, code: str, message: str, status_code: int = 400, detail: dict | None = None):
         self.code = code
@@ -279,16 +281,84 @@ class AppError(Exception):
 
 Python 注释和 docstring 使用简体中文，专有名词可保留英文。
 
-docstring 使用 reST 风格：
+docstring 使用 reST 风格（reStructuredText），所有模块、类、函数、方法均须编写 reST 风格 docstring。
+
+reST docstring 写作规则：
+
+- `"""` 独占首行，摘要从第二行开始。
+- 摘要后空一行，再写详细说明或 reST 指令。
+- `:param name: 描述。` 列出每个参数，顺序与函数签名一致。
+- `:return: 描述。` 说明返回值。
+- `:raises ExceptionType: 描述。` 列出可能抛出的异常。
+- 参数、返回值、异常描述以句号结尾。
+- 无参数、无返回值的函数可省略对应指令，仍保留摘要。
+- 类 docstring 写于类定义下方（`class Foo:` 之后），方法 docstring 写于方法定义下方。
+- 配置模型（Pydantic）和 ORM 模型（SQLAlchemy）的类 docstring 描述建模对象和业务含义。
+- 模块级 docstring 放在文件顶部（import 之前），描述模块职责。
+
+基本示例：
 
 ```python
 async def get_user(user_id: str) -> User:
-    """根据 ID 获取用户。
+    """
+    根据 ID 获取用户。
 
     :param user_id: 用户 ID。
     :return: 用户。
     :raises AppError: 用户不存在时抛出。
     """
+```
+
+多参数示例：
+
+```python
+def create_user(session: AsyncSession, email: str, password: str, display_name: str = "") -> User:
+    """
+    创建新用户。
+
+    :param session: 异步数据库会话。
+    :param email: 用户邮箱，自动转为小写。
+    :param password: 原始密码，调用方传入明文，函数内哈希处理。
+    :param display_name: 显示名称，默认空。
+    :return: 创建后的用户 ORM 实例。
+    :raises AppError: 邮箱已注册时抛出。
+    """
+```
+
+类模型示例：
+
+```python
+class UserPublic(BaseModel):
+    """
+    用户公开信息响应模型。
+
+    仅包含可暴露给 API 消费者的字段，不含密码哈希、内部标记等敏感字段。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """
+    用户 ORM 模型。
+
+    存储用户账户信息，关联用户认证、工作空间成员等。
+    """
+
+    __tablename__ = "user"
+```
+
+property 示例：
+
+```python
+@property
+def is_super_admin(self) -> bool:
+    """
+    是否为超级管理员。
+
+    :return: True 表示用户为超级管理员。
+    """
+    return "super_admin" in (self.roles or "")
 ```
 
 FastAPI 路由要写：
@@ -326,7 +396,9 @@ ReDoc 友好规则：
     },
 )
 async def create_workspace_by_user(...) -> Workspace:
-    """创建工作空间。"""
+    """
+    创建工作空间。
+    """
 ```
 
 ## 测试规则
@@ -398,11 +470,12 @@ git diff --cached
 6. schema 是否覆盖请求、响应和字段校验。
 7. model 是否使用 SQLAlchemy 2.0 async 风格和单数命名。
 8. 错误是否使用统一 `AppError` 和错误码。
-9. 配置、路径、密钥是否集中管理。
-10. 是否有数据库迁移或迁移说明。
-11. 是否补齐接口文档和相关 md 文档。
-12. 是否运行 `uv run ruff check .` 和 `uv run pytest`。
-13. 是否完成 Git 状态检查、相关文件暂存和必要提交。
+9. 所有函数、类、模块是否编写 reST 风格 docstring。
+10. 配置、路径、密钥是否集中管理。
+11. 是否有数据库迁移或迁移说明。
+12. 是否补齐接口文档和相关 md 文档。
+13. 是否运行 `uv run ruff check .` 和 `uv run pytest`。
+14. 是否完成 Git 状态检查、相关文件暂存和必要提交。
 
 ## 详细参考
 
