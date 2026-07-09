@@ -95,7 +95,7 @@ app/
 │       ├── schema.py
 │       └── service.py
 └── utils/
-    └── os_utils.py
+    └── path_utils.py
 ```
 
 规则：

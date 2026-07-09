@@ -102,7 +102,7 @@ class MySQLConfig(BaseModel):
 
 ## 3. 路径工具模式
 
-项目内文件路径统一通过 `app/utils/os_utils.py`：
+项目内文件路径统一通过 `app/utils/path_utils.py`：
 
 ```python
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
