@@ -81,9 +81,14 @@ app/
 │   ├── config.py
 │   ├── database.py
 │   ├── exception.py
+│   ├── lifespan.py
+│   ├── log.py
 │   ├── model.py
 │   ├── security.py
 │   └── dependency.py
+├── client/
+│   ├── redis.py
+│   └── object_storage.py
 ├── feature/
 │   ├── health/
 │   │   ├── router.py
@@ -94,6 +99,8 @@ app/
 │       ├── router.py
 │       ├── schema.py
 │       └── service.py
+├── worker/
+│   └── cleanup.py
 └── utils/
     └── path_utils.py
 ```
@@ -102,8 +109,11 @@ app/
 
 - `app/main.py` 只创建 FastAPI app、配置中间件、注册路由和异常处理。
 - `app/router.py` 统一 include feature router。
-- `app/core/` 只放全局基础能力，例如配置、数据库、异常、安全、缓存、对象存储和基础模型 mixin。
+- `app/core/` 只放全局基础能力，例如配置、数据库会话、异常、安全、依赖、日志、生命周期和基础模型 mixin。
 - `app/feature/<feature>/` 自己维护 `model.py`、`schema.py`、`router.py`、`service.py`。
+- feature 可按需要增加 `dependency.py`、`constant.py`、`status.py`、`prompt/`、`utils/`；只服务单一业务域的内容必须留在该 feature 内。
+- `app/client/` 用于封装 Redis、对象存储、外部 HTTP、模型服务等第三方客户端；客户端必须显式初始化和关闭，不在模块导入时建立连接。
+- `app/worker/` 用于独立进程运行的队列消费者、定时任务和长耗时后台任务；简单项目不需要为了目录完整而创建空目录。
 - 不创建 `app/model`、`app/schema`、`app/api`、`app/service` 这种集中式技术分层目录。
 - 除 `utils` 目录外，项目代码命名优先使用单数名词。
 
@@ -180,6 +190,9 @@ config/config.toml
 - 配置模型使用 `ConfigDict(extra="forbid")`。
 - 密钥和密码字段使用 `SecretStr`。
 - 使用 `@lru_cache` 缓存 `get_settings()`。
+- 运行环境使用受约束字段，例如 `Literal["dev", "test", "prod"]`，由配置统一决定 `debug`、`docs_enabled` 和日志行为，不在入口散落环境分支。
+- 正式配置文件只保存非敏感默认值；密码、token、API Key、私钥通过环境变量、secret mount 或密钥服务注入。
+- `SecretStr` 只避免配置对象意外展示明文，不能替代安全存储和凭据轮换。
 - 新增配置项时同步更新配置文件、部署说明和必要架构文档。
 - 不把数据库、Redis、对象存储 endpoint、bucket、密钥写入业务表。
 
@@ -199,9 +212,17 @@ config/config.toml
 规则：
 
 - 使用 `loguru` 替代标准库 `logging`。
-- 日志轮换周期默认 30 天，可在 `config/config.toml` 中配置。
+- 日志默认每天 `00:00` 轮换，可在 `config/config.toml` 中配置。
+- 控制台 sink 默认开启，便于 Docker、Kubernetes 和进程管理器采集；文件 sink 由配置控制，默认按项目需要开启。
+- 当前活动日志固定使用 `{component}.log`，例如 `api.log`；sink 路径不包含 `{time}`，轮换时由 Loguru 自动给历史文件追加日期，确保当前文件与归档文件一眼可区分。
+- API、worker、定时任务使用不同 `component` 名称和文件名，不让多个独立进程轮换同一个日志文件。
+- 多副本容器共享同一日志目录时关闭文件 sink，或把实例标识加入文件名；不能依靠 `enqueue=True` 协调彼此独立启动的进程。
+- sink 默认使用 `enqueue=True`，避免异步请求被同步写盘阻塞；启用队列后在进程退出前调用 `await logger.complete()`。
+- 生产环境强制 `diagnose=False`，避免异常诊断把局部变量中的敏感数据写入日志；`backtrace` 同样通过配置控制。
 - 日志格式、级别、输出目标在统一日志模块初始化，不在各 feature 中分散配置。
-- 不将密钥、密码、token 写入日志。
+- 重复调用日志初始化函数不能叠加 sink；初始化前使用 `logger.remove()`，并为缺省上下文设置默认值。
+- Uvicorn、Gunicorn 或第三方库继续使用标准库 `logging` 时，统一接管到 Loguru 或明确保留独立 sink；不得同时开启两套 access log 导致重复记录。
+- 业务日志使用参数化占位符和字段白名单，不用 f-string 拼接完整对象。
 
 配置示例：
 
@@ -209,28 +230,66 @@ config/config.toml
 # config/config.toml
 [log]
 level = "INFO"
-rotation = "30 days"
-retention = "90 days"
+rotation = "00:00"
+retention = "30 days"
 dir = "logs"
+file_enabled = true
+enqueue = true
+backtrace = false
+diagnose = false
 ```
 
 ```python
 # app/core/log.py
+import sys
+
 from loguru import logger
 
 from app.core.config import get_settings
+from app.utils.path_utils import get_pathlib_base_join
 
 
-def setup_logging() -> None:
+def setup_logging(component: str = "api") -> None:
+    """
+    配置应用日志。
+
+    :param component: 当前进程组件名，用于区分 API 和不同 worker。
+    """
     settings = get_settings()
-    logger.remove()
-    logger.add(
-        get_pathlib_base_join(settings.log.dir) / "app_{time:YYYY-MM-DD}.log",
-        level=settings.log.level,
-        rotation=settings.log.rotation,
-        retention=settings.log.retention,
-        encoding="utf-8",
+    is_production = settings.app.environment == "prod"
+    diagnose = False if is_production else settings.log.diagnose
+    backtrace = False if is_production else settings.log.backtrace
+    log_format = (
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | "
+        "{extra[component]} | request_id={extra[request_id]} | "
+        "{name}:{function}:{line} - {message}"
     )
+
+    logger.remove()
+    logger.configure(extra={"component": component, "request_id": "-"})
+    logger.add(
+        sys.stdout,
+        level=settings.log.level,
+        format=log_format,
+        colorize=None,
+        enqueue=settings.log.enqueue,
+        backtrace=backtrace,
+        diagnose=diagnose,
+    )
+    if settings.log.file_enabled:
+        log_dir = get_pathlib_base_join(settings.log.dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            log_dir / f"{component}.log",
+            level=settings.log.level,
+            format=log_format,
+            rotation=settings.log.rotation,
+            retention=settings.log.retention,
+            encoding="utf-8",
+            enqueue=settings.log.enqueue,
+            backtrace=backtrace,
+            diagnose=diagnose,
+        )
 ```
 
 业务代码中直接引入使用：
@@ -239,8 +298,48 @@ def setup_logging() -> None:
 from loguru import logger
 
 logger.info("用户登录成功 user_id={}", user_id)
-logger.error("数据库连接失败", exc_info=True)
+
+
+async def connect_database_on_startup() -> None:
+    """
+    在应用启动阶段连接数据库。
+    """
+    try:
+        await connect_database()
+    except Exception:
+        logger.exception("数据库连接失败")
+        raise
 ```
+
+敏感信息规则：
+
+- 不记录 `Authorization`、Cookie、密码、token、OTT、API Key、私钥或完整连接串。
+- 默认不记录完整请求体、响应体、查询参数、上传文件内容、Prompt、模型消息和模型回答。
+- 外部服务失败只记录服务名、状态码、耗时、重试次数和脱敏业务 ID；响应正文必须经过明确白名单和脱敏后才能记录。
+- 调试问题优先记录类型、长度、数量、哈希摘要或脱敏 ID，不把完整业务对象交给 logger。
+- WebSocket 只记录连接 ID、动作类型、状态和耗时，不记录鉴权信息和消息体。
+
+请求链路规则：
+
+- 请求中间件读取合法的 `X-Request-ID`，缺失或不合法时生成 UUID，并在响应头中回传。
+- 使用 `logger.contextualize(request_id=...)` 隔离线程和异步任务上下文，禁止手写无法正确 reset 的全局变量。
+- access log 只记录 method、path、status code、duration 和 request ID，不记录 query string、headers 或 body。
+- 未捕获异常日志必须带 request ID；异常响应仍使用统一安全结构，不向客户端返回堆栈。
+
+## 应用生命周期和后台任务
+
+使用 FastAPI `lifespan` 统一管理应用级资源。
+
+规则：
+
+- 启动时先配置日志，再初始化数据库、Redis、对象存储、模型客户端等共享资源；关闭时按相反顺序释放。
+- 禁止在模块导入阶段发起数据库、Redis、模型加载或外部网络连接，避免测试导入和多 worker 启动产生副作用。
+- 客户端提供显式 `init/connect` 与 `close/disconnect` 接口，通过 lifespan、依赖或 `app.state` 管理，不依赖隐式全局连接。
+- 长耗时、需要重试、要求持久化或定时执行的任务使用独立 worker；FastAPI `BackgroundTasks` 只处理短时、进程内、允许随进程退出丢失的工作。
+- worker 任务必须定义超时、最大重试次数、退避策略和幂等键，并记录 job ID、attempt、duration 和最终状态。
+- worker 客户端优先在 worker 启停钩子中初始化和释放，不在每个 job 中重复建立连接。
+- `/health` 只证明 API 进程存活，`/health/ready` 检查关键外部依赖，`/health/worker` 按需报告 worker 心跳和队列状态。
+- worker 心跳必须有 TTL 和过期判定；Redis 查询使用 `SCAN` 或显式实例登记，不在生产使用 `KEYS` 扫描。
 
 ## 异常响应
 
@@ -275,6 +374,7 @@ class AppError(Exception):
 - 业务错误码使用 `feature.reason` 形式，例如 `auth.invalid_token`。
 - 请求校验错误统一转换为固定响应结构。
 - 未捕获异常不要泄露堆栈和密钥。
+- 成功响应默认直接使用公开资源 schema；现有项目需要统一 envelope 时使用带泛型的响应 schema，并继续返回语义正确的 HTTP 状态码，不能用 HTTP 200 掩盖业务失败。
 - 测试中断言错误码，避免只断言 HTTP 状态码。
 
 ## OpenAPI 和 ReDoc 注释
@@ -411,6 +511,12 @@ async def create_workspace_by_user(...) -> Workspace:
 - 用 helper 函数完成注册、登录、创建资源等重复流程。
 - 对权限、重复提交、过期、撤销、不可见范围等失败路径做断言。
 - 对统一异常格式、配置加载、路径工具、基础模型 mixin 单独测试。
+- 日志测试覆盖重复初始化不产生重复 sink、每天零点轮换、活动文件固定为 `{component}.log`、历史文件带轮换日期、30 天保留、UTF-8 和生产环境 `diagnose=False`。
+- 请求链路测试覆盖 request ID 的生成、合法值透传、响应头回传和并发请求上下文隔离。
+- 敏感日志测试使用假的 token、Cookie、Prompt 和响应正文，断言日志输出不包含原值。
+- lifespan 测试必须显式进入应用生命周期，断言共享客户端各初始化和关闭一次，并覆盖中途初始化失败时的清理。
+- worker 测试覆盖成功、幂等重复执行、超时、重试退避和心跳过期。
+- 配置测试覆盖 dev、test、prod 的文档开关、debug 和日志安全行为。
 
 至少运行：
 
@@ -453,7 +559,9 @@ git diff --cached
 规则：
 
 - 只暂存本次任务相关文件，优先使用 `git add <file>` 或 `git add <dir>`，不要默认 `git add .`。
-- 检查是否误入 `.env`、日志、虚拟环境、缓存、密钥、token 或无关文件。
+- Alembic 迁移文件必须纳入 Git，禁止在 `.gitignore` 中忽略整个迁移目录。
+- 检查是否误入 `.env`、日志、虚拟环境、缓存、真实配置文件、密钥、token 或无关文件。
+- 配置示例只保留占位值；提交前检查 staged diff，项目已配置 secret scanner 时必须运行并处理结果。
 - 提交信息使用 `<type>: <description>`，描述使用简体中文，例如 `docs: 完善 FastAPI 后端规范`。
 - 如果测试或校验无法运行，要在最终回复中说明原因，不要假装通过。
 - 推送远端只在用户要求或项目规则授权时执行；推送失败时保留本地提交并说明原因。
@@ -472,10 +580,14 @@ git diff --cached
 8. 错误是否使用统一 `AppError` 和错误码。
 9. 所有函数、类、模块是否编写 reST 风格 docstring。
 10. 配置、路径、密钥是否集中管理。
-11. 是否有数据库迁移或迁移说明。
-12. 是否补齐接口文档和相关 md 文档。
-13. 是否运行 `uv run ruff check .` 和 `uv run pytest`。
-14. 是否完成 Git 状态检查、相关文件暂存和必要提交。
+11. 日志是否集中初始化、区分 component，并在生产关闭 `diagnose`。
+12. request ID、access log 和敏感信息脱敏是否有测试覆盖。
+13. 共享客户端是否由 lifespan 显式初始化和反向释放，且无导入阶段 I/O。
+14. worker 是否定义超时、重试、幂等和带 TTL 的健康心跳。
+15. 是否有数据库迁移或迁移说明，且迁移文件已纳入 Git。
+16. 是否补齐接口文档和相关 md 文档。
+17. 是否运行 `uv run ruff check .` 和 `uv run pytest`。
+18. 是否完成 staged diff、敏感信息、Git 状态和必要提交检查。
 
 ## 详细参考
 

@@ -4,6 +4,49 @@
 
 ## 1. 应用入口模式
 
+应用级资源在 `app/core/lifespan.py` 中统一管理：
+
+```python
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
+from fastapi import FastAPI
+from loguru import logger
+
+from app.client.object_storage import ObjectStorageClient
+from app.client.redis import RedisClient
+from app.core.config import get_settings
+from app.core.log import setup_logging
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """
+    管理应用级共享资源。
+
+    :param application: FastAPI 应用实例。
+    :return: 应用生命周期异步迭代器。
+    """
+    settings = get_settings()
+    setup_logging(component="api")
+
+    try:
+        async with AsyncExitStack() as stack:
+            redis_client = RedisClient(settings.redis)
+            await redis_client.connect()
+            stack.push_async_callback(redis_client.close)
+
+            object_storage_client = ObjectStorageClient(settings.object_storage)
+            await object_storage_client.connect()
+            stack.push_async_callback(object_storage_client.close)
+
+            application.state.redis_client = redis_client
+            application.state.object_storage_client = object_storage_client
+            yield
+    finally:
+        await logger.complete()
+```
+
 `app/main.py` 只做应用组装：
 
 ```python
@@ -12,6 +55,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.exception import register_exception_handler
+from app.core.lifespan import lifespan
+from app.core.middleware import RequestContextMiddleware
 from app.router import include_router
 
 
@@ -26,9 +71,11 @@ def create_app() -> FastAPI:
         title="项目 API",
         description="项目后端 API。",
         version=settings.app.version,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        debug=settings.app.debug,
+        docs_url="/docs" if settings.app.docs_enabled else None,
+        redoc_url="/redoc" if settings.app.docs_enabled else None,
+        openapi_url="/openapi.json" if settings.app.docs_enabled else None,
+        lifespan=lifespan,
     )
     application.add_middleware(
         CORSMiddleware,
@@ -37,6 +84,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    application.add_middleware(RequestContextMiddleware)
     include_router(application)
     register_exception_handler(application)
     return application
@@ -73,6 +121,14 @@ def include_router(app: FastAPI) -> None:
 
 全局 `/api` 或 `/api/v1` 前缀应集中在这里处理，不要散落到每个 feature router。
 
+生命周期规则：
+
+- 日志必须先于外部客户端初始化，确保启动失败可以被记录。
+- `AsyncExitStack` 按注册的相反顺序释放资源；后续客户端初始化失败时，已成功初始化的客户端仍会关闭。
+- 客户端对象放入 `app.state` 或通过依赖注入提供，不在模块导入阶段建立连接。
+- 启用 `enqueue=True` 时，在所有客户端关闭后执行 `await logger.complete()`，避免退出时丢失排队日志。
+- `docs_enabled`、`debug` 由配置决定，生产环境默认均为 False。
+
 ## 2. 配置模式
 
 配置文件使用 `config/config.toml`，配置模型和 TOML 结构保持一致。
@@ -81,9 +137,47 @@ def include_router(app: FastAPI) -> None:
 
 - 每个配置模型设置 `model_config = ConfigDict(extra="forbid")`。
 - 密码、secret、access key 使用 `SecretStr`。
+- `environment` 使用 `Literal["dev", "test", "prod"]` 等受约束类型。
+- 正式 TOML 只存放非敏感默认值，凭据由环境变量、secret mount 或密钥服务注入。
+- `SecretStr` 只减少 repr、异常和调试输出中的明文暴露，不代表配置文件可以提交真实凭据。
 - 衍生 URL 使用 property 生成，不散落在业务代码。
 - `load_settings(config_path: Path | None = None)` 支持测试传入配置路径。
 - `get_settings()` 使用 `@lru_cache`。
+
+应用和日志配置示例：
+
+```python
+class AppConfig(BaseModel):
+    """
+    应用运行配置。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    environment: Literal["dev", "test", "prod"] = "dev"
+    version: str
+    api_prefix: str = "/api"
+    debug: bool = False
+    docs_enabled: bool = False
+    cors_allow_origins: list[str] = Field(default_factory=list)
+
+
+class LogConfig(BaseModel):
+    """
+    日志输出配置。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    level: str = "INFO"
+    rotation: str = "00:00"
+    retention: str = "30 days"
+    dir: str = "logs"
+    file_enabled: bool = True
+    enqueue: bool = True
+    backtrace: bool = False
+    diagnose: bool = False
+```
 
 示例：
 
@@ -109,6 +203,8 @@ class MySQLConfig(BaseModel):
         database = quote_plus(self.database)
         return f"mysql+asyncmy://{username}:{password}@{self.host}:{self.port}/{database}?charset={self.charset}"
 ```
+
+配置加载后还要强制生产安全默认值：生产环境不得开启 `debug` 或 Loguru `diagnose`。若部署需要开放 API 文档，必须显式配置并记录访问控制方案，不能仅依赖路径隐藏。
 
 ## 3. 路径工具模式
 
@@ -214,6 +310,8 @@ def import_feature_model() -> None:
 
 异步数据库迁移使用 `async_engine_from_config`，数据库 URL 从正式配置读取。
 
+迁移文件是应用发布的一部分，必须纳入 Git。禁止在 `.gitignore` 中忽略 `migrations/` 或 `alembic/versions/`；生产启动只执行经过审查的迁移，不调用 `create_all()` 或 ORM 自动建表替代迁移。
+
 ## 6. Feature 新增流程
 
 新增一个业务域时按顺序做：
@@ -229,6 +327,15 @@ def import_feature_model() -> None:
 9. 更新 `md/api/README.md`，必要时更新架构、数据库、部署和阶段文档。
 
 不要只新增空 router 或占位 service。一个 feature 应尽量形成可运行闭环。
+
+feature 可以按业务需要扩展：
+
+- `dependency.py`：仅该业务域使用的 FastAPI 依赖。
+- `constant.py`、`status.py`：领域常量、状态枚举和错误码定义。
+- `prompt/`：AI feature 自己维护的 Prompt 模板和版本说明。
+- `utils/`：只服务该 feature 的纯工具；被多个 feature 使用后再评估上移。
+
+这些扩展不能替代 router/schema/service/model 的职责，也不能把业务规则重新堆进 `utils.py` 或 `status.py`。
 
 ## 7. Router 模式
 
@@ -400,6 +507,8 @@ class WorkspaceUpdateRequest(BaseModel):
 
 角色值优先用 `Literal` 暴露给 API，用 `StrEnum` 放模型或 service 常量中表达内部规则。
 
+成功响应默认直接返回公开资源 schema。只有现有协议明确要求统一 envelope 时才使用 `ApiResponse[T]` 等泛型 schema；无论是否使用 envelope，都要保留 201、204、400、401、403、404、409、422、503 等真实 HTTP 语义，不能把所有业务失败包装成 HTTP 200。
+
 ## 10. Service 模式
 
 service 中常见函数形态：
@@ -492,18 +601,222 @@ async def get_current_user(
     return await ensure_active_user(user)
 ```
 
-## 12. 外部依赖模式
+## 12. 外部客户端模式
 
-Redis、对象存储、外部 HTTP 等封装在 `app/core/`。
+Redis、对象存储、外部 HTTP、模型服务等适配器优先封装在 `app/client/`。`app/core/` 只负责配置、依赖和生命周期组装，feature 通过依赖获取客户端。
 
-健康检查和就绪检查分开：
+客户端规则：
 
-- `/health` 只证明 API 进程可响应。
-- `/health/ready` 检查 MySQL、Redis、对象存储等外部依赖，失败返回 503。
+- 构造函数只保存配置，不发起网络连接、模型加载或数据库访问。
+- 提供显式 `connect/init` 与 `close/disconnect`，重复调用保持幂等。
+- 由 API lifespan 或 worker 启停钩子初始化和释放，不创建导入即连接的模块级单例。
+- 请求期间复用连接池和 `httpx.AsyncClient`，为连接、读取、写入和总耗时设置明确 timeout。
+- 外部失败转换为稳定的 `AppError` 或 worker 可识别的暂时性/永久性错误，不向上层泄露客户端内部异常和响应正文。
+- 客户端对象可以放入 `app.state`，再通过 FastAPI dependency 暴露；测试使用 `dependency_overrides` 或测试 app state 替换。
 
-多个依赖可用 `asyncio.gather` 并发探活。
+推荐形态：
 
-## 13. 测试模式
+```python
+class RedisClient:
+    """
+    Redis 客户端适配器。
+    """
+
+    def __init__(self, config: RedisConfig) -> None:
+        """
+        创建未连接的 Redis 客户端适配器。
+
+        :param config: Redis 配置。
+        """
+        self._config = config
+        self._client: Redis | None = None
+
+    async def connect(self) -> None:
+        """
+        建立 Redis 连接池。
+        """
+        if self._client is None:
+            self._client = Redis.from_url(self._config.url.get_secret_value())
+            await self._client.ping()
+
+    async def close(self) -> None:
+        """
+        关闭 Redis 连接池。
+        """
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
+
+    def get_client(self) -> Redis:
+        """
+        获取已初始化的 Redis 客户端。
+
+        :return: Redis 客户端。
+        :raises RuntimeError: 客户端尚未初始化时抛出。
+        """
+        if self._client is None:
+            raise RuntimeError("Redis 客户端尚未初始化")
+        return self._client
+```
+
+## 13. 日志和请求链路模式
+
+日志初始化遵循主 Skill 的双 sink、component 隔离和敏感字段白名单。默认 extra 至少包含 `component` 与 `request_id`，确保启动日志、worker 日志和请求日志使用同一格式。
+
+文件 sink 使用固定活动文件名，不在路径中放 `{time}`：
+
+```text
+logs/
+├── api.log                     # 当前自然日正在写入
+├── api.<轮换时间>.log          # API 历史日志
+├── cleanup_worker.log          # 当前清理 worker 日志
+└── cleanup_worker.<轮换时间>.log
+```
+
+默认 `rotation="00:00"`，每天第一条跨零点日志写入前，Loguru 会把原活动文件重命名为带日期的历史文件，再创建同名活动文件。`retention="30 days"` 只清理历史文件，排查当天问题时始终先打开 `{component}.log`。
+
+HTTP 请求使用纯 ASGI 中间件绑定 request ID：
+
+```python
+import re
+from time import monotonic
+from uuid import uuid4
+
+from loguru import logger
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def resolve_request_id(scope: Scope) -> str:
+    """
+    解析或生成请求 ID。
+
+    :param scope: ASGI 请求作用域。
+    :return: 经过校验的请求 ID。
+    """
+    candidate = Headers(scope=scope).get("x-request-id", "")
+    if REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return str(uuid4())
+
+
+class RequestContextMiddleware:
+    """
+    为 HTTP 请求绑定日志上下文并写入响应请求 ID。
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """
+        初始化请求上下文中间件。
+
+        :param app: 下游 ASGI 应用。
+        """
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        处理一次 ASGI 调用。
+
+        :param scope: ASGI 请求作用域。
+        :param receive: ASGI 消息接收函数。
+        :param send: ASGI 消息发送函数。
+        """
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = resolve_request_id(scope)
+        started_at = monotonic()
+        status_code = 500
+
+        async def send_with_request_id(message: Message) -> None:
+            """
+            在响应头中加入请求 ID 并捕获状态码。
+
+            :param message: ASGI 响应消息。
+            """
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+            await send(message)
+
+        with logger.contextualize(request_id=request_id):
+            try:
+                await self.app(scope, receive, send_with_request_id)
+            except Exception:
+                duration_ms = (monotonic() - started_at) * 1000
+                logger.exception(
+                    "请求处理失败 method={} path={} duration_ms={:.2f}",
+                    scope["method"],
+                    scope["path"],
+                    duration_ms,
+                )
+                raise
+            else:
+                duration_ms = (monotonic() - started_at) * 1000
+                logger.info(
+                    "请求完成 method={} path={} status_code={} duration_ms={:.2f}",
+                    scope["method"],
+                    scope["path"],
+                    status_code,
+                    duration_ms,
+                )
+```
+
+请求日志规则：
+
+- 只接受长度不超过 128 且由安全字符组成的上游 request ID；其他值重新生成，避免日志注入。
+- 不记录 query string、headers、Cookie、请求体或响应体；需要排障时增加经过评审的字段白名单。
+- 异常只记录一次。若此中间件负责 access log，应关闭 Uvicorn/Gunicorn 重复 access log；标准库 error log 可通过统一拦截器转发给 Loguru。
+- WebSocket 使用独立 connection ID，并遵守相同的敏感信息规则，不记录鉴权子协议、token 或消息体。
+
+## 14. 独立 Worker 模式
+
+FastAPI `BackgroundTasks` 只适用于短时、进程内且允许随进程终止而丢失的任务。长耗时、定时、需要重试或必须持久化的工作使用独立 worker；项目已有 Redis 时可以按需使用 ARQ，但不将 ARQ 设为所有项目的强制依赖。
+
+worker 约定：
+
+- API 只校验请求、创建业务记录并入队，返回可查询的 job ID；不得在 router 中等待长任务完成。
+- worker 启动时配置独立 component 日志并初始化客户端，关闭时反向释放客户端并等待 `logger.complete()`。
+- 每个任务定义 `job_timeout`、`max_tries` 和退避策略，只对网络超时、限流、短暂不可用等暂时性错误重试。
+- 任务按至少一次投递设计。使用数据库唯一约束、任务状态机或 Redis 原子键实现幂等，不依赖“通常只执行一次”。
+- 日志记录 job ID、任务类型、attempt、duration、状态和脱敏资源 ID，不记录任务完整 payload。
+- cron 任务设置稳定 job ID 或调度幂等键，避免多个调度实例重复执行。
+
+ARQ 配置可以采用以下形态：
+
+```python
+class WorkerSettings:
+    """
+    清理任务 worker 配置。
+    """
+
+    functions = [cleanup_expired_upload]
+    on_startup = startup_worker
+    on_shutdown = shutdown_worker
+    max_jobs = 10
+    job_timeout = 300
+    max_tries = 3
+    health_check_interval = 30
+    cron_jobs = [cron(cleanup_expired_upload, hour=3, minute=0, unique=True)]
+```
+
+具体字段以项目锁定的 ARQ 版本为准。客户端应在 `startup_worker` 放入 worker context，在 `shutdown_worker` 统一关闭，不在每个 job 内重复创建连接池。
+
+## 15. 健康检查模式
+
+运维端点职责分开：
+
+- `/health`：只证明 API 进程和事件循环可响应，不访问外部服务。
+- `/health/ready`：带短 timeout 并发检查 MySQL、Redis、对象存储等关键依赖；任一关键依赖失败返回 503。
+- `/health/worker`：按需报告 worker 实例心跳、队列深度和任务统计，不与 API liveness 混合。
+
+worker 心跳使用结构化数据并设置 TTL，至少包含 component、instance ID 和更新时间。读取实例列表使用 Redis `SCAN`、显式实例集合或队列框架提供的健康接口，不使用会阻塞 Redis 的 `KEYS`，也不把日志文本当作健康协议解析。心跳超过约定阈值即视为失效，响应不得包含主机凭据、连接串或原始任务参数。
+
+## 16. 测试模式
 
 `tests/conftest.py` 推荐提供隔离客户端：
 
@@ -548,8 +861,15 @@ async def client() -> AsyncGenerator[AsyncClient]:
 - 权限类接口覆盖未登录、无权限、角色变化、资源不可见。
 - 时间类逻辑覆盖过期、未过期和时区。
 - 安全类逻辑确认不返回 token hash、密码 hash、secret 等内部字段。
+- 日志初始化调用两次后只保留预期 sink，并验证活动文件固定为 `{component}.log`、`rotation="00:00"`、历史文件带轮换日期、`retention="30 days"`、UTF-8 和生产 `diagnose=False`。
+- 用内存 sink 捕获日志，传入假的 token、Cookie、Prompt、模型回答和外部响应正文，断言原值没有出现。
+- 并发发起带不同 `X-Request-ID` 的请求，断言响应头和日志上下文一一对应；非法或缺失值应生成新 UUID。
+- lifespan 测试显式进入生命周期。同步测试使用 `with TestClient(app)`；异步 `ASGITransport` fixture 需要显式配套 lifespan manager，不能假设 transport 自动触发启动和关闭。
+- lifespan 覆盖全部客户端成功、后续客户端初始化失败、应用关闭三种情况，断言每个已初始化资源恰好释放一次。
+- worker 覆盖成功、永久失败不重试、暂时失败退避、幂等重复投递、超时和心跳过期。
+- 配置覆盖 dev、test、prod，断言生产关闭 debug、API 文档和 Loguru diagnose。
 
-## 14. 文档维护模式
+## 17. 文档维护模式
 
 根 README 只放简介、快速启动和文档导航。
 
@@ -568,7 +888,7 @@ md/deploy/README.md
 
 接口变更同步 API 文档。表结构变更同步数据库文档。配置、Docker、外部服务变更同步部署文档。架构、权限、错误响应和存储策略变更同步架构或决策文档。
 
-## 15. 质量门禁
+## 18. 质量门禁
 
 常用命令：
 
@@ -599,9 +919,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 - ruff 检查通过。
 - pytest 通过。
 - 文档已同步或明确检查后无需更新。
-- 没有提交 `.env`、缓存、虚拟环境、日志、密钥。
+- Alembic 迁移文件已生成、审查并纳入 Git，`.gitignore` 没有忽略迁移目录。
+- 没有提交 `.env`、真实环境配置、缓存、虚拟环境、日志、密钥或 token。
+- 检查 staged diff；项目配置了 Gitleaks、detect-secrets 等 secret scanner 时必须执行并处理结果。
 
-## 16. Git 跟踪和提交模式
+## 19. Git 跟踪和提交模式
 
 完成一轮可运行功能、规范沉淀、文档同步或重要修复后，进行 Git 跟踪和提交。
 
@@ -622,7 +944,7 @@ git add tests/test_workspace.py
 git add md/api/README.md
 ```
 
-不要默认使用 `git add .`。先确认没有 `.env`、日志、虚拟环境、缓存目录、密钥、token 或无关文件。
+不要默认使用 `git add .`。先确认没有 `.env`、真实环境配置、日志、虚拟环境、缓存目录、密钥、token 或无关文件，同时确认迁移文件没有被错误忽略。
 
 提交信息使用：
 
